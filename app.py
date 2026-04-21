@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
@@ -223,7 +224,9 @@ def inspect_one(uploaded_name: str, raw_bytes: bytes) -> dict[str, Any]:
 
     if target is None:
         status = "不匹配"
-    elif has_real_dpi and tw == aw and th == ah and is_match_100_dpi(dpi_pair):
+    elif has_real_dpi and is_match_100_dpi(dpi_pair) and (
+        (tw == aw and th == ah) or (tw == ah and th == aw)  # 核心修复：允许宽高互换（横竖图兼容）
+    ):
         status = "匹配"
     else:
         status = "不匹配"
@@ -260,26 +263,52 @@ def main() -> None:
         return
 
     total_count = len(files)
+    
+    # 新增：明确的上传完成提示
+    st.info(f"📥 浏览器已将 {total_count} 张图片传输至系统内存，即将启动 4 线程极速体检引擎...")
+    
     progress_bar = st.progress(0.0)
     status_placeholder = st.empty()
 
-    # 节流刷新，避免纯内存高速处理时界面频闪
     update_step = max(1, total_count // 50)
-
     rows = []
-    for idx, f in enumerate(files, start=1):
-        name = getattr(f, "name", None) or "未命名"
-        data = f.getvalue()
-        rows.append(inspect_one(name, data))
+    completed = 0
 
-        if idx == 1 or idx == total_count or idx % update_step == 0:
-            progress_bar.progress(idx / total_count)
-            status_placeholder.info(f"正在体检第 {idx}/{total_count} 张：{name} ...")
+    # 核心修复：使用 4 线程池并发处理图片解析
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # 提交所有任务到线程池
+        future_to_name = {
+            executor.submit(inspect_one, getattr(f, "name", "未命名"), f.getvalue()): getattr(f, "name", "未命名")
+            for f in files
+        }
+
+        # 获取完成的结果
+        for future in as_completed(future_to_name):
+            completed += 1
+            name = future_to_name[future]
+            try:
+                row_result = future.result()
+                rows.append(row_result)
+            except Exception as e:
+                rows.append({
+                    "图片名称": name,
+                    "图片目标大小": "—",
+                    "图片修改后尺寸": f"处理异常: {e}",
+                    "DPI值": "—",
+                    "匹配状态": "不匹配"
+                })
+
+            # 实时更新 UI 进度条
+            if completed == 1 or completed == total_count or completed % update_step == 0:
+                progress_bar.progress(completed / total_count)
+                status_placeholder.info(f"🚀 4 线程高速体检中：已完成 {completed}/{total_count} 张 (当前: {name}) ...")
 
     progress_bar.progress(1.0)
     progress_bar.empty()
     status_placeholder.empty()
-    st.success(f"✅ 体检任务圆满完成！共计成功上传并分析 {total_count} 张图片。")
+    
+    # 新增：上传与处理最终汇报
+    st.success(f"✅ **上传与体检全部完成！** 系统已成功接收并极速分析了 **{total_count}** 张图片。")
 
     df = pd.DataFrame(rows)
 
